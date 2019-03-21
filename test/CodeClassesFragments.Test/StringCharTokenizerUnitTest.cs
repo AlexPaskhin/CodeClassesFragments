@@ -1,3 +1,6 @@
+// Copyright © Alexander Paskhin 2018. All rights reserved.
+//  Licensed under GNU General Public License v3.0
+
 using System;
 using Xunit;
 

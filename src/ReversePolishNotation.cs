@@ -22,7 +22,7 @@ namespace CodeClassesFragments
         public ParsedType ElementType { get; set; }
     }
 
-    public class FunctionalService: 
+    public class FunctionalService 
     {
 
         public List<ParsedElement> ParseExpression(String expression)
