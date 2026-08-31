@@ -1,333 +1,285 @@
 <#
 .SYNOPSIS
-    shadowSolutionV2 - Creates "shadow" .csproj copies (*.@.csproj) for every child-folder
-    project, rewires references between them, strips legacy TargetFrameworks, ensures an
-    AssemblyName, builds a grouped *.@.slnx, and keeps .gitignore files up to date.
+    ShadowSolutionV2 - Creates shadow (*.@.csproj) copies of all child project files,
+    rewires references between them, strips legacy target frameworks, ensures an
+    AssemblyName is set, builds a grouped shadow *.@.slnx solution, and updates
+    every .gitignore to exclude the generated shadow files.
 
 .DESCRIPTION
-    Run from the solution root. See inline #region blocks for each numbered requirement.
+    Run this script from the solution root. It operates on all *.csproj files found
+    in child folders (recursively).
+
+.NOTES
+    Requires PowerShell 5.1+ (uses [xml] for csproj manipulation).
 #>
 
 [CmdletBinding()]
 param(
     [string]$RootPath = (Get-Location).Path,
-    [string]$SolutionName = (Split-Path -Leaf (Get-Location).Path),
 
-    # Target framework monikers to strip out of <TargetFrameworks>
-    [string[]]$ObsoleteFrameworks = @('net451','net452','net461','net462','netstandard2.0','netstandard2.1')
+    # Name of the grouped shadow solution file that will be created (without extension).
+    [string]$SlnxName = 'Solution.@',
+
+    # Frameworks to strip from every TargetFramework(s) element.
+    [string[]]$FrameworksToRemove = @(
+        'net451','net452','net461','net462','netstandard2.0','netstandard2.1'
+    )
 )
 
 $ErrorActionPreference = 'Stop'
-$ShadowSuffix = '.@.csproj'
 
-#region 1. Find all child-folder *.csproj files
-function Get-ChildProjectFiles {
-    <#
-        Finds every *.csproj that lives in a CHILD folder of $RootPath
-        (i.e. excludes any .csproj sitting directly in the root itself).
-    #>
-    param([string]$Path = $RootPath)
-
-    Get-ChildItem -Path $Path -Recurse -File -Filter '*.csproj' |
-        Where-Object {
-            $_.FullName -notlike "*$ShadowSuffix" -and
-            $_.DirectoryName -ne (Resolve-Path $Path).Path
-        }
-}
-#endregion
-
-#region 3. Empty function - filter out projects by -like folder names
-function Test-ProjectFolderExcluded {
-    <#
-        TODO: Fill in the -like patterns for folder names that should be
-        excluded from shadow processing, e.g. 'tests', 'samples*', '*.Tests'.
-
-        Return $true to EXCLUDE the project, $false to include it.
-    #>
+# ---------------------------------------------------------------------------
+# 3. Empty filter function - customize -like patterns here to exclude folders
+#    (case-insensitive). Return $true to EXCLUDE a project.
+# ---------------------------------------------------------------------------
+function Test-ExcludedFolder {
     param(
-        [Parameter(Mandatory)][System.IO.FileInfo]$ProjectFile
+        [Parameter(Mandatory)][string]$FolderName
     )
 
-    $excludedFolderPatterns = @(
-        'bin', 'obj', 'tests', '*.Tests', 'samples*'
-    )
+    # Add -like patterns below, e.g.:
+    # $excludePatterns = @('*obj*', '*bin*', '*test*')
+    $excludePatterns = @()
 
-    foreach ($pattern in $excludedFolderPatterns) {
-        if ($ProjectFile.DirectoryName -like $pattern) {
+    foreach ($pattern in $excludePatterns) {
+        if ($FolderName -like $pattern) {
             return $true
         }
     }
 
     return $false
 }
-#endregion
 
-#region 4. Empty function - map project name to alias package name
-function Get-ProjectPackageAlias {
-    <#
-        TODO: Fill in the mapping of project name -> NuGet package name that
-        this project should "shadow" (i.e. the PackageReference to replace
-        with a ProjectReference to this project's shadow csproj).
+# ---------------------------------------------------------------------------
+# 1. Find all *.csproj files in child folders (skip already-shadowed files)
+# ---------------------------------------------------------------------------
+function Get-SourceProjects {
+    param([string]$Root)
 
-        Return $null / empty string if the project has no alias package.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$ProjectName
-    )
-
-    $projectToPackageAlias = @{
-        # 'MyCompany.Core'    = 'MyCompany.Core.Contracts'
-        # 'MyCompany.Logging' = 'MyCompany.Logging.Abstractions'
-    }
-
-    if ($projectToPackageAlias.ContainsKey($ProjectName)) {
-        return $projectToPackageAlias[$ProjectName]
-    }
-
-    return $null
+    Get-ChildItem -Path $Root -Recurse -Filter '*.csproj' -File |
+        Where-Object {
+            $_.Name -notlike '*.@.csproj' -and
+            -not (Test-ExcludedFolder -FolderName $_.Directory.Name)
+        }
 }
-#endregion
 
-#region 2. Copy each project to *.@.csproj
-function New-ShadowProjectFile {
-    param([Parameter(Mandatory)][System.IO.FileInfo]$ProjectFile)
+# ---------------------------------------------------------------------------
+# 2. Copy each project to *.@.csproj
+# ---------------------------------------------------------------------------
+function Copy-ShadowProject {
+    param([System.IO.FileInfo]$SourceFile)
 
-    $shadowName = "$([System.IO.Path]::GetFileNameWithoutExtension($ProjectFile.Name))$ShadowSuffix"
-    $shadowPath = Join-Path $ProjectFile.DirectoryName $shadowName
+    $shadowName = "$($SourceFile.BaseName).@.csproj"
+    $shadowPath = Join-Path $SourceFile.DirectoryName $shadowName
 
-    Copy-Item -Path $ProjectFile.FullName -Destination $shadowPath -Force
-    Write-Verbose "Created shadow project: $shadowPath"
-
+    Copy-Item -Path $SourceFile.FullName -Destination $shadowPath -Force
     return Get-Item $shadowPath
 }
-#endregion
 
-#region 5. Update ProjectReference paths *.csproj -> *.@.csproj
-function Update-ProjectReferencePaths {
-    param([Parameter(Mandatory)][string]$ShadowProjectPath)
+# ---------------------------------------------------------------------------
+# 4. In ProjectReference entries, update *.csproj -> *.@.csproj
+# ---------------------------------------------------------------------------
+function Update-ProjectReferences {
+    param([xml]$Xml)
 
-    $content = Get-Content -Path $ShadowProjectPath -Raw
-
-    # Rewrite ProjectReference Include="...\Foo.csproj" -> "...\Foo.@.csproj"
-    $updated = [regex]::Replace(
-        $content,
-        '(<ProjectReference\s+[^>]*Include\s*=\s*"[^"]*?)(?<!\.@)\.csproj(")',
-        '$1.@.csproj$2'
-    )
-
-    if ($updated -ne $content) {
-        Set-Content -Path $ShadowProjectPath -Value $updated -NoNewline
-        Write-Verbose "Updated ProjectReference paths in: $ShadowProjectPath"
-    }
-
-    return $updated
-}
-#endregion
-
-#region 6. Replace matching PackageReference entries with ProjectReference entries
-function Update-PackageReferencesWithAliases {
-    param(
-        [Parameter(Mandatory)][string]$ShadowProjectPath,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$PackageToProjectMap
-    )
-
-    $content = Get-Content -Path $ShadowProjectPath -Raw
-
-    foreach ($packageName in $PackageToProjectMap.Keys) {
-        $targetShadowPath = $PackageToProjectMap[$packageName]
-
-        $relativePath = [System.IO.Path]::GetRelativePath(
-            (Split-Path $ShadowProjectPath -Parent),
-            $targetShadowPath
-        )
-
-        # Match self-closing or open/close PackageReference tags for this package
-        $pattern = '<PackageReference\s+[^>]*Include\s*=\s*"' + [regex]::Escape($packageName) + '"[^>]*?(/>|>.*?</PackageReference>)'
-        $replacement = "<ProjectReference Include=`"$relativePath`" />"
-
-        $content = [regex]::Replace($content, $pattern, { param($m) $replacement }, 'Singleline')
-    }
-
-    Set-Content -Path $ShadowProjectPath -Value $content -NoNewline
-    Write-Verbose "Resolved package aliases in: $ShadowProjectPath"
-}
-#endregion
-
-#region 7. Remove obsolete TargetFrameworks
-function Remove-ObsoleteTargetFrameworks {
-    param(
-        [Parameter(Mandatory)][string]$ShadowProjectPath,
-        [string[]]$Frameworks = $ObsoleteFrameworks
-    )
-
-    $content = Get-Content -Path $ShadowProjectPath -Raw
-
-    # Multi-target: <TargetFrameworks>net6.0;net461;netstandard2.0</TargetFrameworks>
-    $content = [regex]::Replace($content, '<TargetFrameworks>(.*?)</TargetFrameworks>', {
-        param($m)
-        $remaining = ($m.Groups[1].Value -split ';') |
-            Where-Object { $_.Trim() -and ($Frameworks -notcontains $_.Trim()) }
-        "<TargetFrameworks>$($remaining -join ';')</TargetFrameworks>"
-    })
-
-    # Single target: <TargetFramework>net461</TargetFramework>
-    $content = [regex]::Replace($content, '<TargetFramework>(.*?)</TargetFramework>', {
-        param($m)
-        if ($Frameworks -contains $m.Groups[1].Value.Trim()) {
-            Write-Warning "Project '$ShadowProjectPath' targets only an obsolete framework ('$($m.Groups[1].Value)'); leaving element in place for manual review."
+    $refs = $Xml.SelectNodes('//ProjectReference')
+    foreach ($ref in $refs) {
+        $include = $ref.GetAttribute('Include')
+        if ([string]::IsNullOrWhiteSpace($include)) { continue }
+        if ($include -like '*.csproj' -and $include -notlike '*.@.csproj') {
+            $newInclude = $include -replace '\.csproj$', '.@.csproj'
+            $ref.SetAttribute('Include', $newInclude)
         }
-        $m.Value
-    })
-
-    Set-Content -Path $ShadowProjectPath -Value $content -NoNewline
-    Write-Verbose "Removed obsolete TargetFrameworks in: $ShadowProjectPath"
-}
-#endregion
-
-#region 8. Add AssemblyName if not already present
-function Add-AssemblyNameIfMissing {
-    param([Parameter(Mandatory)][string]$ShadowProjectPath)
-
-    $content = Get-Content -Path $ShadowProjectPath -Raw
-
-    if ($content -match '<AssemblyName>') {
-        return
     }
-
-    $assemblyName = [System.IO.Path]::GetFileNameWithoutExtension(
-        [System.IO.Path]::GetFileNameWithoutExtension($ShadowProjectPath)  # strips both .@ and .csproj
-    )
-
-    # Insert into the first PropertyGroup found
-    $updated = [regex]::Replace(
-        $content,
-        '(<PropertyGroup>)',
-        "`$1`r`n    <AssemblyName>$assemblyName</AssemblyName>",
-        1
-    )
-
-    Set-Content -Path $ShadowProjectPath -Value $updated -NoNewline
-    Write-Verbose "Added AssemblyName '$assemblyName' to: $ShadowProjectPath"
 }
-#endregion
 
-#region 9. Manually create a grouped *.@.slnx solution
+# ---------------------------------------------------------------------------
+# 5. Replace matching PackageReference entries with ProjectReference entries
+#    A PackageReference is "matching" if its Include name equals the
+#    AssemblyName/project name of one of the discovered shadow projects.
+# ---------------------------------------------------------------------------
+function Convert-PackageReferenceToProjectReference {
+    param(
+        [xml]$Xml,
+        [System.IO.FileInfo]$ShadowProjectFile,
+        [hashtable]$ProjectNameMap   # Name -> shadow .csproj full path
+    )
+
+    $packageRefs = @($Xml.SelectNodes('//PackageReference'))
+    foreach ($pkgRef in $packageRefs) {
+        $pkgName = $pkgRef.GetAttribute('Include')
+        if ([string]::IsNullOrWhiteSpace($pkgName)) { continue }
+
+        if ($ProjectNameMap.ContainsKey($pkgName)) {
+            $targetShadowPath = $ProjectNameMap[$pkgName]
+            $relativePath = Resolve-RelativePath -From $ShadowProjectFile.DirectoryName -To $targetShadowPath
+
+            $itemGroup = $pkgRef.ParentNode
+            $projRef = $Xml.CreateElement('ProjectReference')
+            $projRef.SetAttribute('Include', $relativePath)
+            $itemGroup.ReplaceChild($projRef, $pkgRef) | Out-Null
+        }
+    }
+}
+
+function Resolve-RelativePath {
+    param([string]$From, [string]$To)
+
+    $fromUri = New-Object System.Uri(($From.TrimEnd('\') + '\'))
+    $toUri = New-Object System.Uri($To)
+    $relativeUri = $fromUri.MakeRelativeUri($toUri)
+    return ([System.Uri]::UnescapeDataString($relativeUri.ToString())) -replace '/', '\'
+}
+
+# ---------------------------------------------------------------------------
+# 6. Remove legacy target frameworks
+# ---------------------------------------------------------------------------
+function Remove-TargetFrameworks {
+    param([xml]$Xml, [string[]]$Frameworks)
+
+    foreach ($tag in @('TargetFrameworks', 'TargetFramework')) {
+        $nodes = $Xml.SelectNodes("//$tag")
+        foreach ($node in $nodes) {
+            $values = $node.InnerText -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $filtered = $values | Where-Object {
+                $current = $_
+                -not ($Frameworks | Where-Object { $current -ieq $_ })
+            }
+
+            if ($filtered.Count -eq 0) {
+                $node.ParentNode.RemoveChild($node) | Out-Null
+            }
+            elseif ($tag -eq 'TargetFrameworks' -and $filtered.Count -eq 1) {
+                # Collapse to single TargetFramework element
+                $newNode = $Xml.CreateElement('TargetFramework')
+                $newNode.InnerText = $filtered[0]
+                $node.ParentNode.ReplaceChild($newNode, $node) | Out-Null
+            }
+            else {
+                $node.InnerText = ($filtered -join ';')
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. Add AssemblyName if missing
+# ---------------------------------------------------------------------------
+function Add-AssemblyNameIfMissing {
+    param([xml]$Xml, [string]$DefaultName)
+
+    $existing = $Xml.SelectSingleNode('//AssemblyName')
+    if (-not $existing) {
+        $propertyGroup = $Xml.SelectSingleNode('//PropertyGroup')
+        if (-not $propertyGroup) {
+            $propertyGroup = $Xml.CreateElement('PropertyGroup')
+            $Xml.Project.AppendChild($propertyGroup) | Out-Null
+        }
+        $asmName = $Xml.CreateElement('AssemblyName')
+        $asmName.InnerText = $DefaultName
+        $propertyGroup.AppendChild($asmName) | Out-Null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 8. Build grouped *.@.slnx solution manually
+# ---------------------------------------------------------------------------
 function New-ShadowSlnx {
     param(
-        [Parameter(Mandatory)][System.IO.FileInfo[]]$ShadowProjects,
-        [Parameter(Mandatory)][string]$RootPath,
-        [Parameter(Mandatory)][string]$SolutionName
+        [string]$Root,
+        [string]$SlnxName,
+        [System.IO.FileInfo[]]$ShadowProjects
     )
 
-    $slnxPath = Join-Path $RootPath "$SolutionName.@.slnx"
-
-    # Group projects by their immediate parent folder relative to root (solution folders)
-    $groups = $ShadowProjects | Group-Object {
-        $rel = [System.IO.Path]::GetRelativePath($RootPath, $_.DirectoryName)
-        ($rel -split '[\\/]')[0]
-    } | Sort-Object Name
+    $slnxPath = Join-Path $Root "$SlnxName.slnx"
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<Solution>')
 
-    foreach ($group in $groups) {
-        [void]$sb.AppendLine("  <Folder Name=`"/$($group.Name)/`">")
-        foreach ($proj in ($group.Group | Sort-Object Name)) {
-            $relPath = [System.IO.Path]::GetRelativePath($RootPath, $proj.FullName).Replace('\', '/')
-            [void]$sb.AppendLine("    <Project Path=`"$relPath`" />")
+    $grouped = $ShadowProjects | Group-Object { $_.Directory.Parent.Name }
+
+    foreach ($group in $grouped) {
+        $folderName = $group.Name
+        [void]$sb.AppendLine("  <Folder Name=""/$folderName/"">")
+        foreach ($proj in $group.Group) {
+            $relPath = Resolve-RelativePath -From $Root -To $proj.FullName
+            [void]$sb.AppendLine("    <Project Path=""$relPath"" />")
         }
         [void]$sb.AppendLine('  </Folder>')
     }
 
     [void]$sb.AppendLine('</Solution>')
 
-    Set-Content -Path $slnxPath -Value $sb.ToString() -NoNewline
-    Write-Verbose "Created shadow solution: $slnxPath"
-
-    return $slnxPath
+    Set-Content -Path $slnxPath -Value $sb.ToString() -Encoding UTF8
+    Write-Host "Created shadow solution: $slnxPath"
 }
-#endregion
 
-#region 10. Add *.@.csproj to every .gitignore
+# ---------------------------------------------------------------------------
+# 9. Add *.@.csproj to every .gitignore (create root .gitignore if none exist)
+# ---------------------------------------------------------------------------
 function Update-GitIgnoreFiles {
-    param(
-        [Parameter(Mandatory)][string]$RootPath,
-        [string]$Pattern = "*$ShadowSuffix"
-    )
+    param([string]$Root)
 
-    $gitIgnores = Get-ChildItem -Path $RootPath -Recurse -File -Filter '.gitignore' -Force
+    $entry = '*.@.csproj'
+    $gitignores = @(Get-ChildItem -Path $Root -Recurse -Filter '.gitignore' -File)
 
-    if (-not $gitIgnores) {
-        $rootGitIgnore = Join-Path $RootPath '.gitignore'
-        Set-Content -Path $rootGitIgnore -Value $Pattern
-        Write-Verbose "Created .gitignore with entry: $Pattern"
+    if ($gitignores.Count -eq 0) {
+        $rootGitIgnore = Join-Path $Root '.gitignore'
+        Set-Content -Path $rootGitIgnore -Value $entry -Encoding UTF8
+        Write-Host "Created .gitignore: $rootGitIgnore"
         return
     }
 
-    foreach ($gitIgnore in $gitIgnores) {
-        $lines = @()
-        if (Test-Path $gitIgnore.FullName) {
-            $lines = Get-Content -Path $gitIgnore.FullName
-        }
-
-        if ($lines -notcontains $Pattern) {
-            Add-Content -Path $gitIgnore.FullName -Value $Pattern
-            Write-Verbose "Added '$Pattern' to: $($gitIgnore.FullName)"
+    foreach ($gi in $gitignores) {
+        $lines = @(Get-Content -Path $gi.FullName -ErrorAction SilentlyContinue)
+        if (-not ($lines -contains $entry)) {
+            Add-Content -Path $gi.FullName -Value $entry
+            Write-Host "Updated .gitignore: $($gi.FullName)"
         }
     }
 }
-#endregion
 
-#region Orchestration
-function Invoke-ShadowSolutionV2 {
-    param(
-        [string]$RootPath = $RootPath,
-        [string]$SolutionName = $SolutionName
-    )
+# ===========================================================================
+# MAIN
+# ===========================================================================
 
-    Write-Host "Scanning for child-folder projects under: $RootPath"
-    $allProjects = Get-ChildProjectFiles -Path $RootPath
+Write-Host "ShadowSolutionV2 starting in: $RootPath"
 
-    $includedProjects = $allProjects | Where-Object { -not (Test-ProjectFolderExcluded -ProjectFile $_) }
-
-    if (-not $includedProjects) {
-        Write-Warning "No projects found to process."
-        return
-    }
-
-    Write-Host "Creating shadow projects (*$ShadowSuffix)..."
-    $shadowProjects = foreach ($project in $includedProjects) {
-        New-ShadowProjectFile -ProjectFile $project
-    }
-
-    # Build a lookup: package alias name -> shadow project full path
-    $packageToProjectMap = @{}
-    foreach ($shadow in $shadowProjects) {
-        $projectName = [System.IO.Path]::GetFileNameWithoutExtension(
-            [System.IO.Path]::GetFileNameWithoutExtension($shadow.FullName)
-        )
-        $alias = Get-ProjectPackageAlias -ProjectName $projectName
-        if ($alias) {
-            $packageToProjectMap[$alias] = $shadow.FullName
-        }
-    }
-
-    Write-Host "Rewiring references and cleaning up shadow project files..."
-    foreach ($shadow in $shadowProjects) {
-        Update-ProjectReferencePaths -ShadowProjectPath $shadow.FullName
-        Update-PackageReferencesWithAliases -ShadowProjectPath $shadow.FullName -PackageToProjectMap $packageToProjectMap
-        Remove-ObsoleteTargetFrameworks -ShadowProjectPath $shadow.FullName
-        Add-AssemblyNameIfMissing -ShadowProjectPath $shadow.FullName
-    }
-
-    Write-Host "Building grouped shadow solution..."
-    $slnxPath = New-ShadowSlnx -ShadowProjects $shadowProjects -RootPath $RootPath -SolutionName $SolutionName
-
-    Write-Host "Updating .gitignore files..."
-    Update-GitIgnoreFiles -RootPath $RootPath
-
-    Write-Host "Done. Shadow solution: $slnxPath"
+$sourceProjects = Get-SourceProjects -Root $RootPath
+if ($sourceProjects.Count -eq 0) {
+    Write-Warning "No source *.csproj files found."
+    return
 }
-#endregion
 
-# Invoke-ShadowSolutionV2 -RootPath $RootPath -SolutionName $SolutionName
+# Pass 1: copy all shadow projects and build name -> shadow path map
+$shadowProjects = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+$projectNameMap = @{}
+
+foreach ($src in $sourceProjects) {
+    $shadow = Copy-ShadowProject -SourceFile $src
+    $shadowProjects.Add($shadow)
+    $projectNameMap[$src.BaseName] = $shadow.FullName
+}
+
+# Pass 2: edit each shadow project's XML content
+foreach ($shadow in $shadowProjects) {
+    [xml]$xml = Get-Content -Path $shadow.FullName -Raw
+
+    Update-ProjectReferences -Xml $xml
+    Convert-PackageReferenceToProjectReference -Xml $xml -ShadowProjectFile $shadow -ProjectNameMap $projectNameMap
+    Remove-TargetFrameworks -Xml $xml -Frameworks $FrameworksToRemove
+
+    $defaultAssemblyName = $shadow.BaseName -replace '\.@$', ''
+    Add-AssemblyNameIfMissing -Xml $xml -DefaultName $defaultAssemblyName
+
+    $xml.Save($shadow.FullName)
+    Write-Host "Processed shadow project: $($shadow.FullName)"
+}
+
+# Step 8: grouped shadow slnx
+New-ShadowSlnx -Root $RootPath -SlnxName $SlnxName -ShadowProjects $shadowProjects
+
+# Step 9: gitignore updates
+Update-GitIgnoreFiles -Root $RootPath
+
+Write-Host "ShadowSolutionV2 complete."
